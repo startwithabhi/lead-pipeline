@@ -238,9 +238,49 @@ def audit_leads(leads, google_key, anthropic_key, progress_cb=None):
 # STEP 3: RANK
 # ---------------------------------------------------------------------------
 
+def _repair_truncated_array(text):
+    """Best-effort recovery when the array got cut off mid-object (hit the
+    token limit) - keep whichever leading objects are fully closed and drop
+    the truncated tail, rather than losing the whole response."""
+    start = text.find("[")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    last_good_end = None
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                last_good_end = i
+    if last_good_end is None:
+        return None
+    candidate = text[start:last_good_end + 1] + "]"
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, list) else None
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 def _extract_json_array(text):
     """Robustly pull a JSON array out of a Claude response, even if it's
-    wrapped in prose, a markdown fence without a language tag, or a dict."""
+    wrapped in prose, a markdown fence without a language tag, a dict, or
+    got cut off mid-object because it ran out of tokens."""
     candidates = [text.strip()]
     candidates.append(re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip())
     start, end = text.find("["), text.rfind("]")
@@ -257,7 +297,7 @@ def _extract_json_array(text):
             for v in parsed.values():
                 if isinstance(v, list):
                     return v
-    return None
+    return _repair_truncated_array(text)
 
 
 def rank_leads(audited_leads, anthropic_key, top_n=3):
@@ -272,12 +312,13 @@ def rank_leads(audited_leads, anthropic_key, top_n=3):
         "(b) how likely they are to have budget (review count/rating as a proxy for business size), "
         "(c) how easy they'd be to reach (WhatsApp/Instagram active, phone listed). "
         "For each, estimate a plausible monthly revenue loss range in INR from poor web presence, "
-        "and explain your reasoning in 2-3 sentences.\n\n"
+        "and explain your reasoning in 1-2 short sentences (be concise - you're ranking multiple "
+        "leads, not writing an essay on each one).\n\n"
         "Respond ONLY as a JSON array, no preamble, no markdown fences, in this shape:\n"
         '[{"business": "...", "rank": 1, "reasoning": "...", '
         '"estimated_monthly_revenue_loss_inr": "e.g. 15,000-40,000"}]'
     )
-    raw = call_claude(prompt, anthropic_key, max_tokens=2000)
+    raw = call_claude(prompt, anthropic_key, max_tokens=4096)
     parsed = _extract_json_array(raw)
     if parsed is None:
         return [{"business": None, "raw_response": raw or "(Claude returned an empty response)"}]
