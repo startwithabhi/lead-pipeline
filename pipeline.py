@@ -52,7 +52,7 @@ def call_claude(prompt, anthropic_key, system=None, max_tokens=1500):
     }
     if system:
         body["system"] = system
-    resp = requests.post(ANTHROPIC_URL, headers=headers, json=body, timeout=60)
+    resp = requests.post(ANTHROPIC_URL, headers=headers, json=body, timeout=120)
     if resp.status_code == 401:
         raise PipelineError("Anthropic API key was rejected (401). Check the key.")
     resp.raise_for_status()
