@@ -1,11 +1,11 @@
 """
-Lead Pipeline web app.
-Run with:  python app.py
-Then open: http://127.0.0.1:5050
+Lead Pipeline web app - fully stateless per-step API.
+The browser drives the pipeline by calling one endpoint per lead per stage.
+There is NO server-side job state (no in-memory dict, no background thread),
+so a mid-run server restart/redeploy/hiccup only ever costs the single
+in-flight request - never the whole run - and the browser can just retry it.
 """
-import threading
-import uuid
-from datetime import datetime
+import os
 
 from flask import Flask, jsonify, render_template_string, request
 from flask_limiter import Limiter
@@ -16,79 +16,8 @@ import pipeline as pl
 app = Flask(__name__)
 
 # Visitors bring their own API keys, so their usage costs are theirs -
-# but this still limits how hard any one visitor can hit *your* server.
-limiter = Limiter(get_remote_address, app=app, default_limits=["60 per hour"], storage_uri="memory://")
-
-JOBS = {}
-JOBS_LOCK = threading.Lock()
-
-
-def _find_lead(leads, name):
-    if not name:
-        return None
-    for l in leads:
-        if l["name"].strip().lower() == name.strip().lower():
-            return l
-    matches = [l for l in leads if name.strip().lower() in l["name"].strip().lower()]
-    return matches[0] if len(matches) == 1 else None
-
-
-def _log(job_id, stage, message):
-    with JOBS_LOCK:
-        JOBS[job_id]["log"].append({"stage": stage, "message": message, "t": datetime.now().isoformat()})
-
-
-def _run_job(job_id, niche, location, limit, top, language, google_key, anthropic_key):
-    try:
-        _log(job_id, 1, f"Searching Google Places for '{niche}' in '{location}'...")
-        leads = pl.scrape_leads(niche, location, google_key, limit)
-        with JOBS_LOCK:
-            JOBS[job_id]["leads"] = leads
-        _log(job_id, 1, f"Found {len(leads)} businesses.")
-
-        _log(job_id, 2, "Auditing websites...")
-        audited = pl.audit_leads(
-            leads, google_key, anthropic_key,
-            progress_cb=lambda msg: _log(job_id, 2, msg),
-        )
-        with JOBS_LOCK:
-            JOBS[job_id]["audited"] = audited
-
-        _log(job_id, 3, f"Ranking leads to find the top {top} opportunities...")
-        ranked = pl.rank_leads(audited, anthropic_key, top)
-        _log(job_id, 3, "Ranking complete.")
-
-        results = []
-        for entry in ranked:
-            biz_name = entry.get("business")
-            lead = _find_lead(audited, biz_name) if biz_name else None
-            if not lead:
-                results.append({"rank_info": entry, "lead": None})
-                continue
-            _log(job_id, 4, f"Writing build prompt for {biz_name}...")
-            build_text = pl.generate_build_prompt(lead, anthropic_key)
-            _log(job_id, 5, f"Drafting outreach for {biz_name}...")
-            outreach_text = pl.generate_outreach(lead, anthropic_key, language)
-            results.append({
-                "rank_info": entry,
-                "lead": lead,
-                "build_prompt": build_text,
-                "outreach": outreach_text,
-            })
-
-        with JOBS_LOCK:
-            JOBS[job_id]["status"] = "done"
-            JOBS[job_id]["results"] = results
-        _log(job_id, 5, "Done.")
-
-    except pl.PipelineError as e:
-        with JOBS_LOCK:
-            JOBS[job_id]["status"] = "error"
-            JOBS[job_id]["error"] = str(e)
-    except Exception as e:
-        with JOBS_LOCK:
-            JOBS[job_id]["status"] = "error"
-            JOBS[job_id]["error"] = f"Unexpected error: {e}"
+# this just limits how hard any one visitor can hit *your* server.
+limiter = Limiter(get_remote_address, app=app, default_limits=["400 per hour"], storage_uri="memory://")
 
 
 @app.errorhandler(429)
@@ -117,33 +46,73 @@ def api_scrape():
         return jsonify({"ok": False, "error": f"Unexpected error: {e}"}), 500
 
 
-@app.route("/api/run", methods=["POST"])
-@limiter.limit("5 per hour")
-def api_run():
+@app.route("/api/audit_one", methods=["POST"])
+@limiter.limit("200 per hour")
+def api_audit_one():
     data = request.get_json(force=True)
-    job_id = str(uuid.uuid4())
-    with JOBS_LOCK:
-        JOBS[job_id] = {"status": "running", "log": [], "leads": [], "audited": [], "results": [], "error": None}
-    t = threading.Thread(
-        target=_run_job,
-        args=(
-            job_id, data.get("niche", ""), data.get("location", ""),
-            int(data.get("limit", 20)), int(data.get("top", 3)),
-            data.get("language", "Hinglish"), data.get("google_key", ""), data.get("anthropic_key", ""),
-        ),
-        daemon=True,
-    )
-    t.start()
-    return jsonify({"ok": True, "job_id": job_id})
+    lead = data.get("lead", {}) or {}
+    google_key = data.get("google_key", "")
+    anthropic_key = data.get("anthropic_key", "")
+    try:
+        entry = dict(lead)
+        website = (lead.get("website") or "").strip()
+        if not website:
+            entry["audit"] = {"note": "No website found."}
+            entry["audit_summary"] = (
+                "- No website at all: zero owned web presence beyond Maps/social.\n"
+                "- Anyone searching Google for this business by name finds only the Maps listing / social pages.\n"
+                "- Full opportunity: any decent site is a 100% upgrade over nothing."
+            )
+        else:
+            raw = pl.audit_website(website, google_key)
+            entry["audit"] = raw
+            entry["audit_summary"] = pl.summarize_audit(lead, raw, anthropic_key)
+        return jsonify({"ok": True, "lead": entry})
+    except pl.PipelineError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Unexpected error auditing {lead.get('name', 'this lead')}: {e}"}), 500
 
 
-@app.route("/api/run/<job_id>")
-def api_run_status(job_id):
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            return jsonify({"ok": False, "error": "Unknown job id"}), 404
-        return jsonify({"ok": True, **job})
+@app.route("/api/rank", methods=["POST"])
+@limiter.limit("30 per hour")
+def api_rank():
+    data = request.get_json(force=True)
+    try:
+        ranked = pl.rank_leads(data.get("leads", []), data.get("anthropic_key", ""), int(data.get("top", 3)))
+        return jsonify({"ok": True, "ranked": ranked})
+    except pl.PipelineError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Unexpected error ranking leads: {e}"}), 500
+
+
+@app.route("/api/build_one", methods=["POST"])
+@limiter.limit("100 per hour")
+def api_build_one():
+    data = request.get_json(force=True)
+    lead = data.get("lead", {}) or {}
+    try:
+        text = pl.generate_build_prompt(lead, data.get("anthropic_key", ""))
+        return jsonify({"ok": True, "build_prompt": text})
+    except pl.PipelineError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Unexpected error building prompt for {lead.get('name','this lead')}: {e}"}), 500
+
+
+@app.route("/api/outreach_one", methods=["POST"])
+@limiter.limit("100 per hour")
+def api_outreach_one():
+    data = request.get_json(force=True)
+    lead = data.get("lead", {}) or {}
+    try:
+        text = pl.generate_outreach(lead, data.get("anthropic_key", ""), data.get("language", "Hinglish"))
+        return jsonify({"ok": True, "outreach": text})
+    except pl.PipelineError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Unexpected error drafting outreach for {lead.get('name','this lead')}: {e}"}), 500
 
 
 INDEX_HTML = r"""
@@ -223,6 +192,7 @@ button.small{padding:5px 10px; font-size:12px;}
 .log{background:#0f1116; border:1px solid var(--border); border-radius:8px; padding:12px 14px; max-height:160px; overflow-y:auto; font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--muted); margin-top:16px;}
 .log div{padding:2px 0;}
 .log div.s5{color:var(--sage);}
+.log div.err{color:var(--rust);}
 
 table{width:100%; border-collapse:collapse; font-size:13px;}
 th{text-align:left; color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; padding:8px 10px; border-bottom:1px solid var(--border);}
@@ -339,8 +309,6 @@ td{padding:9px 10px; border-bottom:1px solid var(--border);}
 </div>
 
 <script>
-let currentJob = null;
-let pollTimer = null;
 let lastResults = null;
 
 function saveKeys(){
@@ -368,6 +336,13 @@ function esc(s){
   return (s || '').toString().replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+async function postJSON(url, body){
+  const resp = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const data = await resp.json();
+  if(!data.ok) throw new Error(data.error || `Request to ${url} failed`);
+  return data;
+}
+
 async function previewLeads(){
   const errBox = document.getElementById('previewError');
   const tableBox = document.getElementById('previewTable');
@@ -379,10 +354,7 @@ async function previewLeads(){
   const btn = document.getElementById('previewBtn');
   btn.disabled = true; btn.textContent = 'Searching...';
   try{
-    const resp = await fetch('/api/scrape', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({niche, location, limit, ...getKeys()})});
-    const data = await resp.json();
-    if(!data.ok){ errBox.innerHTML = `<div class="error-box">${esc(data.error)}</div>`; return; }
+    const data = await postJSON('/api/scrape', {niche, location, limit, ...getKeys()});
     let rows = data.leads.map(l => `
       <tr>
         <td>${esc(l.name)}</td>
@@ -397,10 +369,42 @@ async function previewLeads(){
       </table>
       <small class="hint" style="margin-top:8px;">${data.leads.length} found. Run the full pipeline to audit, rank, and build outreach for these.</small>`;
   }catch(e){
-    errBox.innerHTML = `<div class="error-box">Request failed: ${esc(e.message)}</div>`;
+    errBox.innerHTML = `<div class="error-box">${esc(e.message)}</div>`;
   }finally{
     btn.disabled = false; btn.textContent = 'Preview leads';
   }
+}
+
+function resetRail(){
+  document.querySelectorAll('.stage').forEach(s => s.classList.remove('active','done'));
+  document.getElementById('railFill').style.width = '0%';
+}
+function updateRail(stageNum, status){
+  document.querySelectorAll('.stage').forEach(s => {
+    const n = parseInt(s.dataset.stage);
+    s.classList.remove('active','done');
+    if(n < stageNum || status === 'done') s.classList.add('done');
+    else if(n === stageNum) s.classList.add('active');
+  });
+  const pct = status === 'done' ? 100 : ((stageNum - 1) / 4) * 100;
+  document.getElementById('railFill').style.width = pct + '%';
+}
+function logLine(stage, message, isErr){
+  const box = document.getElementById('logBox');
+  const div = document.createElement('div');
+  div.className = 's' + stage + (isErr ? ' err' : '');
+  div.textContent = `[${stage}] ${message}`;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  updateRail(stage, 'running');
+}
+
+function findLeadByName(leads, name){
+  if(!name) return null;
+  const exact = leads.find(l => l.name.trim().toLowerCase() === name.trim().toLowerCase());
+  if(exact) return exact;
+  const matches = leads.filter(l => l.name.toLowerCase().includes(name.trim().toLowerCase()));
+  return matches.length === 1 ? matches[0] : null;
 }
 
 async function runPipeline(){
@@ -422,74 +426,53 @@ async function runPipeline(){
   document.getElementById('logBox').innerHTML = '';
   resetRail();
 
-  const resp = await fetch('/api/run', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({niche, location, limit, top, language, ...keys})});
-  const data = await resp.json();
-  if(!data.ok){ errBox.innerHTML = `<div class="error-box">${esc(data.error)}</div>`; document.getElementById('runBtn').disabled = false; return; }
-  currentJob = data.job_id;
-  let shownLogCount = 0;
-  const runStartedAt = Date.now();
-  const MAX_WAIT_MS = 6 * 60 * 1000; // 6 minutes - long enough for a big batch, short enough to catch a real hang
-  pollTimer = setInterval(async () => {
-    let job;
-    try{
-      const r = await fetch(`/api/run/${currentJob}`);
-      job = await r.json();
-    }catch(e){
-      clearInterval(pollTimer);
-      document.getElementById('runBtn').disabled = false;
-      errBox.innerHTML = `<div class="error-box">Lost connection while checking progress: ${esc(e.message)}. The server may have restarted — try running the pipeline again, maybe with fewer leads.</div>`;
-      return;
-    }
-    if(!job.ok){
-      clearInterval(pollTimer);
-      document.getElementById('runBtn').disabled = false;
-      errBox.innerHTML = `<div class="error-box">Lost track of this run (the server likely restarted mid-job, which can happen on a free hosting tier). Nothing wrong with your keys or data — just click "Run full pipeline" again. If it keeps happening, try scanning fewer leads at once.</div>`;
-      return;
-    }
-    renderLog(job.log, shownLogCount);
-    shownLogCount = job.log.length;
-    const stages = job.log.map(l => l.stage);
-    updateRail(stages.length ? Math.max(...stages) : 0, job.status);
-    if(job.status === 'done'){
-      clearInterval(pollTimer);
-      document.getElementById('runBtn').disabled = false;
-      renderResults(job.results, niche, location);
-    } else if(job.status === 'error'){
-      clearInterval(pollTimer);
-      document.getElementById('runBtn').disabled = false;
-      errBox.innerHTML = `<div class="error-box">${esc(job.error)}</div>`;
-    } else if(Date.now() - runStartedAt > MAX_WAIT_MS){
-      clearInterval(pollTimer);
-      document.getElementById('runBtn').disabled = false;
-      errBox.innerHTML = `<div class="error-box">This run has been going for over 6 minutes with no result, which usually means something got stuck server-side rather than genuinely still working. Try again with fewer "leads to scan" (e.g. 10 instead of 20).</div>`;
-    }
-  }, 1200);
-}
+  try{
+    logLine(1, `Searching Google Places for '${niche}' in '${location}'...`);
+    const scrapeData = await postJSON('/api/scrape', {niche, location, limit, ...keys});
+    const leads = scrapeData.leads;
+    logLine(1, `Found ${leads.length} businesses.`);
 
-function resetRail(){
-  document.querySelectorAll('.stage').forEach(s => s.classList.remove('active','done'));
-  document.getElementById('railFill').style.width = '0%';
-}
-function updateRail(maxStage, status){
-  document.querySelectorAll('.stage').forEach(s => {
-    const n = parseInt(s.dataset.stage);
-    s.classList.remove('active','done');
-    if(n < maxStage || (status === 'done')) s.classList.add('done');
-    else if(n === maxStage) s.classList.add('active');
-  });
-  const pct = status === 'done' ? 100 : ((maxStage - 1) / 4) * 100;
-  document.getElementById('railFill').style.width = pct + '%';
-}
-function renderLog(log, fromIndex){
-  const box = document.getElementById('logBox');
-  for(let i = fromIndex; i < log.length; i++){
-    const div = document.createElement('div');
-    div.className = 's' + log[i].stage;
-    div.textContent = `[${log[i].stage}] ${log[i].message}`;
-    box.appendChild(div);
+    const audited = [];
+    for(let i = 0; i < leads.length; i++){
+      logLine(2, `Auditing ${i+1}/${leads.length}: ${leads[i].name}`);
+      try{
+        const d = await postJSON('/api/audit_one', {lead: leads[i], ...keys});
+        audited.push(d.lead);
+      }catch(e){
+        logLine(2, `Skipped ${leads[i].name} (${e.message})`, true);
+      }
+    }
+    if(audited.length === 0) throw new Error('No leads could be audited - check the log above for why each one failed.');
+
+    logLine(3, `Ranking leads to find the top ${top} opportunities...`);
+    const rankData = await postJSON('/api/rank', {leads: audited, top, anthropic_key: keys.anthropic_key});
+    logLine(3, 'Ranking complete.');
+
+    const results = [];
+    for(const entry of rankData.ranked){
+      const bizName = entry.business;
+      const lead = findLeadByName(audited, bizName);
+      if(!lead){ results.push({rank_info: entry, lead: null}); continue; }
+      try{
+        logLine(4, `Writing build prompt for ${bizName}...`);
+        const bData = await postJSON('/api/build_one', {lead, anthropic_key: keys.anthropic_key});
+        logLine(5, `Drafting outreach for ${bizName}...`);
+        const oData = await postJSON('/api/outreach_one', {lead, anthropic_key: keys.anthropic_key, language});
+        results.push({rank_info: entry, lead, build_prompt: bData.build_prompt, outreach: oData.outreach});
+      }catch(e){
+        logLine(5, `Failed for ${bizName}: ${e.message}`, true);
+        results.push({rank_info: entry, lead, build_prompt: null, outreach: null, step_error: e.message});
+      }
+    }
+
+    logLine(5, 'Done.');
+    updateRail(5, 'done');
+    renderResults(results, niche, location);
+  }catch(e){
+    errBox.innerHTML = `<div class="error-box">${esc(e.message)}</div>`;
+  }finally{
+    document.getElementById('runBtn').disabled = false;
   }
-  box.scrollTop = box.scrollHeight;
 }
 
 function copyText(id){
@@ -513,7 +496,7 @@ function renderResults(results, niche, location){
     const l = r.lead;
     const waNumber = l.phone_intl;
     const firstMsg = (r.outreach || '').split(/Follow-up/i)[0].replace(/First message:?/i, '').trim();
-    const waLink = waNumber ? `https://wa.me/${waNumber}?text=${encodeURIComponent(firstMsg)}` : null;
+    const waLink = waNumber && r.outreach ? `https://wa.me/${waNumber}?text=${encodeURIComponent(firstMsg)}` : null;
     html += `
       <div class="card">
         <span class="rank-num mono">RANK #${r.rank_info.rank || idx+1}</span>
@@ -529,12 +512,14 @@ function renderResults(results, niche, location){
         <div class="subhead">Audit summary</div>
         <div class="audit-summary">${esc(l.audit_summary || '')}</div>
 
-        <div class="subhead">Build prompt <button class="ghost small" id="build-btn-${idx}" onclick="copyText('build-${idx}')">Copy</button></div>
+        ${r.step_error ? `<div class="error-box">Build/outreach step failed for this lead: ${esc(r.step_error)}</div>` : `
+        <div class="subhead">Build prompt <button class="ghost small" onclick="copyText('build-${idx}')">Copy</button></div>
         <div class="codebox" id="build-${idx}" data-raw="${esc(r.build_prompt)}">${esc(r.build_prompt)}</div>
 
-        <div class="subhead">Outreach (${document.getElementById('language').value}) <button class="ghost small" onclick="copyText('outreach-${idx}')">Copy</button></div>
+        <div class="subhead">Outreach (${esc(document.getElementById('language').value)}) <button class="ghost small" onclick="copyText('outreach-${idx}')">Copy</button></div>
         <div class="outreach-box" id="outreach-${idx}" data-raw="${esc(r.outreach)}">${esc(r.outreach)}</div>
         ${waLink ? `<a class="wa-link" href="${waLink}" target="_blank">Open in WhatsApp &rarr;</a>` : ''}
+        `}
       </div>`;
   });
   box.innerHTML = html;
@@ -552,8 +537,8 @@ function downloadReport(niche, location){
     md += `\n**Why this lead:** ${r.rank_info.reasoning || ''}\n`;
     md += `\n**Estimated monthly revenue loss:** INR ${r.rank_info.estimated_monthly_revenue_loss_inr || 'n/a'}\n`;
     md += `\n**Audit summary:**\n${l.audit_summary || ''}\n`;
-    md += `\n**Build prompt:**\n\`\`\`\n${r.build_prompt}\n\`\`\`\n`;
-    md += `\n**Outreach:**\n${r.outreach}\n`;
+    if(r.build_prompt) md += `\n**Build prompt:**\n\`\`\`\n${r.build_prompt}\n\`\`\`\n`;
+    if(r.outreach) md += `\n**Outreach:**\n${r.outreach}\n`;
   });
   const blob = new Blob([md], {type:'text/markdown'});
   const a = document.createElement('a');
@@ -567,6 +552,6 @@ function downloadReport(niche, location){
 """
 
 if __name__ == "__main__":
-    port = int(__import__("os").environ.get("PORT", 5050))
+    port = int(os.environ.get("PORT", 5050))
     print(f"Lead Pipeline running at http://127.0.0.1:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
