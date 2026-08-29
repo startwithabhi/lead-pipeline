@@ -428,10 +428,25 @@ async function runPipeline(){
   if(!data.ok){ errBox.innerHTML = `<div class="error-box">${esc(data.error)}</div>`; document.getElementById('runBtn').disabled = false; return; }
   currentJob = data.job_id;
   let shownLogCount = 0;
+  const runStartedAt = Date.now();
+  const MAX_WAIT_MS = 6 * 60 * 1000; // 6 minutes - long enough for a big batch, short enough to catch a real hang
   pollTimer = setInterval(async () => {
-    const r = await fetch(`/api/run/${currentJob}`);
-    const job = await r.json();
-    if(!job.ok){ clearInterval(pollTimer); return; }
+    let job;
+    try{
+      const r = await fetch(`/api/run/${currentJob}`);
+      job = await r.json();
+    }catch(e){
+      clearInterval(pollTimer);
+      document.getElementById('runBtn').disabled = false;
+      errBox.innerHTML = `<div class="error-box">Lost connection while checking progress: ${esc(e.message)}. The server may have restarted — try running the pipeline again, maybe with fewer leads.</div>`;
+      return;
+    }
+    if(!job.ok){
+      clearInterval(pollTimer);
+      document.getElementById('runBtn').disabled = false;
+      errBox.innerHTML = `<div class="error-box">Lost track of this run (the server likely restarted mid-job, which can happen on a free hosting tier). Nothing wrong with your keys or data — just click "Run full pipeline" again. If it keeps happening, try scanning fewer leads at once.</div>`;
+      return;
+    }
     renderLog(job.log, shownLogCount);
     shownLogCount = job.log.length;
     const stages = job.log.map(l => l.stage);
@@ -444,6 +459,10 @@ async function runPipeline(){
       clearInterval(pollTimer);
       document.getElementById('runBtn').disabled = false;
       errBox.innerHTML = `<div class="error-box">${esc(job.error)}</div>`;
+    } else if(Date.now() - runStartedAt > MAX_WAIT_MS){
+      clearInterval(pollTimer);
+      document.getElementById('runBtn').disabled = false;
+      errBox.innerHTML = `<div class="error-box">This run has been going for over 6 minutes with no result, which usually means something got stuck server-side rather than genuinely still working. Try again with fewer "leads to scan" (e.g. 10 instead of 20).</div>`;
     }
   }, 1200);
 }
