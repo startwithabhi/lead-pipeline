@@ -238,6 +238,28 @@ def audit_leads(leads, google_key, anthropic_key, progress_cb=None):
 # STEP 3: RANK
 # ---------------------------------------------------------------------------
 
+def _extract_json_array(text):
+    """Robustly pull a JSON array out of a Claude response, even if it's
+    wrapped in prose, a markdown fence without a language tag, or a dict."""
+    candidates = [text.strip()]
+    candidates.append(re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip())
+    start, end = text.find("["), text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(text[start:end + 1])
+    for c in candidates:
+        try:
+            parsed = json.loads(c)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            for v in parsed.values():
+                if isinstance(v, list):
+                    return v
+    return None
+
+
 def rank_leads(audited_leads, anthropic_key, top_n=3):
     leads_block = "\n\n".join(
         f"Business: {l['name']}\nRating: {l.get('rating', 'N/A')} ({l.get('review_count', 'N/A')} reviews)\n"
@@ -255,12 +277,11 @@ def rank_leads(audited_leads, anthropic_key, top_n=3):
         '[{"business": "...", "rank": 1, "reasoning": "...", '
         '"estimated_monthly_revenue_loss_inr": "e.g. 15,000-40,000"}]'
     )
-    raw = call_claude(prompt, anthropic_key, max_tokens=1200)
-    cleaned = re.sub(r"^```json|```$", "", raw.strip(), flags=re.MULTILINE).strip()
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        return [{"business": None, "raw_response": raw}]
+    raw = call_claude(prompt, anthropic_key, max_tokens=2000)
+    parsed = _extract_json_array(raw)
+    if parsed is None:
+        return [{"business": None, "raw_response": raw or "(Claude returned an empty response)"}]
+    return parsed
 
 
 # ---------------------------------------------------------------------------
