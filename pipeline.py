@@ -14,8 +14,7 @@ try:
 except ImportError:
     BeautifulSoup = None
 
-TEXTSEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
+TEXTSEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 PAGESPEED_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = "claude-sonnet-5"
@@ -68,46 +67,54 @@ def call_claude(prompt, anthropic_key, system=None, max_tokens=1500):
 # ---------------------------------------------------------------------------
 
 def scrape_leads(niche, location, google_key, limit=20):
+    """Uses Places API (New) - the legacy Text Search API can no longer be
+    enabled on new Google Cloud projects, so this calls the current endpoint,
+    which conveniently returns rating/reviews/phone/website in one call
+    (no separate Place Details request needed)."""
     if not google_key:
         raise PipelineError("Google Maps API key is missing.")
     query = f"{niche} in {location}"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": google_key,
+        "X-Goog-FieldMask": (
+            "places.displayName,places.formattedAddress,places.nationalPhoneNumber,"
+            "places.internationalPhoneNumber,places.rating,places.userRatingCount,"
+            "places.websiteUri,nextPageToken"
+        ),
+    }
     leads = []
-    params = {"query": query, "key": google_key}
-    for _ in range(3):  # Google paginates in 3 pages max, 20 results/page
-        resp = requests.get(TEXTSEARCH_URL, params=params, timeout=30).json()
-        status = resp.get("status")
-        if status == "REQUEST_DENIED":
-            raise PipelineError(f"Google Places request denied: {resp.get('error_message', 'check API key / billing / Places API enabled')}")
-        if status not in ("OK", "ZERO_RESULTS"):
-            raise PipelineError(f"Places Text Search error: {status} - {resp.get('error_message', '')}")
-        for place in resp.get("results", []):
-            leads.append({"place_id": place["place_id"], "name": place.get("name", "")})
+    page_token = None
+    for _ in range(3):  # up to 3 pages, 20 results/page = 60 max, matches old behavior
+        body = {"textQuery": query, "pageSize": min(limit, 20)}
+        if page_token:
+            body["pageToken"] = page_token
+        resp = requests.post(TEXTSEARCH_URL, headers=headers, json=body, timeout=30)
+        if resp.status_code in (400, 403):
+            try:
+                msg = resp.json().get("error", {}).get("message", resp.text)
+            except Exception:
+                msg = resp.text
+            raise PipelineError(f"Google Places request denied: {msg}")
+        resp.raise_for_status()
+        data = resp.json()
+        for p in data.get("places", []):
+            leads.append({
+                "name": p.get("displayName", {}).get("text", ""),
+                "address": p.get("formattedAddress", ""),
+                "phone": p.get("nationalPhoneNumber") or p.get("internationalPhoneNumber") or "",
+                "phone_intl": re.sub(r"[^\d]", "", p.get("internationalPhoneNumber") or ""),
+                "rating": p.get("rating", ""),
+                "review_count": p.get("userRatingCount", ""),
+                "website": p.get("websiteUri", ""),
+            })
             if len(leads) >= limit:
                 break
-        next_token = resp.get("next_page_token")
-        if not next_token or len(leads) >= limit:
+        page_token = data.get("nextPageToken")
+        if not page_token or len(leads) >= limit:
             break
-        time.sleep(2)
-        params = {"pagetoken": next_token, "key": google_key}
-
-    detailed = []
-    fields = "name,formatted_phone_number,international_phone_number,website,rating,user_ratings_total,formatted_address"
-    for lead in leads:
-        d = requests.get(
-            DETAILS_URL,
-            params={"place_id": lead["place_id"], "fields": fields, "key": google_key},
-            timeout=30,
-        ).json().get("result", {})
-        detailed.append({
-            "name": d.get("name", lead["name"]),
-            "address": d.get("formatted_address", ""),
-            "phone": d.get("formatted_phone_number") or d.get("international_phone_number") or "",
-            "phone_intl": re.sub(r"[^\d]", "", d.get("international_phone_number") or ""),
-            "rating": d.get("rating", ""),
-            "review_count": d.get("user_ratings_total", ""),
-            "website": d.get("website", ""),
-        })
-    return detailed
+        time.sleep(2)  # next page token needs a moment to become valid
+    return leads[:limit]
 
 
 # ---------------------------------------------------------------------------
