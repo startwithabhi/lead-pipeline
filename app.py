@@ -11,6 +11,7 @@ from flask import Flask, jsonify, render_template_string, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+import fingerprint as fpmod
 import pipeline as pl
 
 app = Flask(__name__)
@@ -115,6 +116,62 @@ def api_outreach_one():
         return jsonify({"ok": False, "error": f"Unexpected error drafting outreach for {lead.get('name','this lead')}: {e}"}), 500
 
 
+@app.route("/api/fingerprint_batch", methods=["POST"])
+@limiter.limit("200 per hour")
+def api_fingerprint_batch():
+    """Fingerprint a small chunk of domains.
+
+    The browser sends chunks rather than the whole list so each request stays
+    short - a 25-domain call would be a 30-60s request, which is exactly the
+    shape that dies on a restart. fingerprint_many() still parallelises
+    inside the chunk, and one bad domain is already handled in there.
+    """
+    data = request.get_json(force=True)
+    domains = data.get("domains") or []
+    if not isinstance(domains, list) or not domains:
+        return jsonify({"ok": False, "error": "No domains supplied."}), 400
+    if len(domains) > 12:
+        return jsonify({"ok": False, "error": "Chunk too large; send 12 domains or fewer."}), 400
+    try:
+        leads = fpmod.fingerprint_many(domains, use_cache=bool(data.get("use_cache", True)))
+        return jsonify({"ok": True, "leads": leads})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Fingerprint chunk failed: {e}"}), 500
+
+
+@app.route("/api/pagespeed_batch", methods=["POST"])
+@limiter.limit("200 per hour")
+def api_pagespeed_batch():
+    """Optional. Returns {domain: mobile_score}. Failures are simply omitted."""
+    data = request.get_json(force=True)
+    domains = data.get("domains") or []
+    google_key = data.get("google_key", "")
+    out = {}
+    for d in domains[:12]:
+        try:
+            _, score = pl._pagespeed_score(f"https://{d}/", google_key)
+            if score is not None:
+                out[d] = score
+        except Exception:
+            pass  # a domain with no speed score just gets no speed gap
+    return jsonify({"ok": True, "pagespeed": out})
+
+
+@app.route("/api/score", methods=["POST"])
+@limiter.limit("60 per hour")
+def api_score():
+    """Ecommerce-mode ranking. Local mode still uses /api/rank (Claude)."""
+    data = request.get_json(force=True)
+    try:
+        ranked = fpmod.score_leads(
+            data.get("leads") or [],
+            data.get("pagespeed_by_domain") or {},
+        )
+        return jsonify({"ok": True, "leads": ranked})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Scoring failed: {e}"}), 500
+
+
 INDEX_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
@@ -216,6 +273,42 @@ td{padding:9px 10px; border-bottom:1px solid var(--border);}
 
 .error-box{background:#2a1414; border:1px solid #5a2a2a; color:#e59a9a; padding:14px 16px; border-radius:8px; font-size:13.5px; margin-bottom:16px;}
 .hidden{display:none;}
+
+textarea{
+  background:var(--panel-2); border:1px solid var(--border); color:var(--text);
+  padding:9px 11px; border-radius:6px; font-size:13px; font-family:'IBM Plex Mono',monospace;
+  resize:vertical; width:100%;
+}
+textarea:focus{outline:1px solid var(--amber); border-color:var(--amber);}
+input[type=file]{font-size:12px; color:var(--muted); padding:7px 0; border:none; background:none;}
+
+/* Fingerprint results table */
+.fp-table{width:100%; border-collapse:collapse; font-size:13px; table-layout:auto;}
+.fp-table th{white-space:nowrap;}
+.fp-table td{vertical-align:top;}
+.fp-row{cursor:pointer;}
+.fp-row:hover{background:var(--panel-2);}
+.fp-row td{border-bottom:1px solid var(--border);}
+.fp-domain{font-family:'IBM Plex Mono',monospace; color:var(--text); font-weight:500;}
+.fp-caret{color:var(--muted); font-size:10px; margin-right:6px;}
+.score-cell{font-family:'IBM Plex Mono',monospace; font-weight:600; white-space:nowrap;}
+.score-hi{color:var(--sage);} .score-mid{color:var(--amber);} .score-lo{color:var(--muted);}
+.chip{display:inline-block; padding:2px 7px; border-radius:99px; font-size:10.5px;
+  font-family:'IBM Plex Mono',monospace; margin:0 4px 4px 0; white-space:nowrap;}
+.chip.has{background:#182119; color:var(--sage); border:1px solid #2a4a35;}
+.chip.gap{background:#2a2109; color:var(--amber); border:1px solid var(--amber-dim);}
+.chip.plat{background:var(--panel-2); color:var(--muted); border:1px solid var(--border);}
+.contact-cell{font-size:12px; color:var(--muted); word-break:break-all;}
+.contact-cell a{color:var(--amber); text-decoration:none;}
+.detail-row td{background:#0f1116; border-bottom:1px solid var(--border); padding:16px 14px;}
+.detail-grid{display:flex; gap:24px; flex-wrap:wrap; margin-bottom:14px;}
+.parts-item{font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--muted);}
+.parts-item b{color:var(--text); font-weight:600;}
+.gap-item{border-left:2px solid var(--amber-dim); padding:6px 0 6px 12px; margin-bottom:10px;}
+.gap-item .gap-name{font-weight:600; font-size:13px;}
+.gap-item .gap-ev{font-size:12px; color:var(--muted); font-family:'IBM Plex Mono',monospace;}
+.gap-item .gap-pitch{font-size:13px; color:var(--text); margin-top:3px;}
+.status-bad{color:var(--rust); font-size:12px; font-family:'IBM Plex Mono',monospace;}
 .footer-note{color:var(--muted); font-size:12px; text-align:center; margin-top:30px;}
 </style>
 </head>
@@ -252,18 +345,57 @@ td{padding:9px 10px; border-bottom:1px solid var(--border);}
 
 <div class="panel">
   <h2><span class="mono">[01]</span> Configure the run</h2>
+
   <div class="row">
     <div class="field">
-      <label>Niche</label>
-      <input id="niche" placeholder="e.g. clothing boutique">
-    </div>
-    <div class="field">
-      <label>Location</label>
-      <input id="location" placeholder="e.g. Siliguri, West Bengal">
+      <label>Lead source</label>
+      <select id="leadSource" onchange="onSourceChange()">
+        <option value="local">Local businesses (Google Places)</option>
+        <option value="ecom">Ecommerce stores (paste domains / CSV)</option>
+      </select>
     </div>
   </div>
+
+  <div id="localFields">
+    <div class="row" style="margin-top:12px;">
+      <div class="field">
+        <label>Niche</label>
+        <input id="niche" placeholder="e.g. clothing boutique">
+      </div>
+      <div class="field">
+        <label>Location</label>
+        <input id="location" placeholder="e.g. Siliguri, West Bengal">
+      </div>
+    </div>
+  </div>
+
+  <div id="ecomFields" class="hidden">
+    <div class="row" style="margin-top:12px;">
+      <div class="field">
+        <label>Domains (one per line)</label>
+        <textarea id="domains" rows="6" placeholder="example-store.com&#10;anotherbrand.in&#10;https://third-store.com/collections/all"></textarea>
+        <small class="hint">Full URLs are fine - they get reduced to the bare domain. No Google key needed in this mode.</small>
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <div class="field">
+        <label>...or upload a CSV with a "domain" column</label>
+        <input type="file" id="csvFile" accept=".csv,text/csv" onchange="loadCsv()">
+        <small class="hint" id="csvStatus"></small>
+      </div>
+      <div class="field">
+        <label>PageSpeed check</label>
+        <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:13px;color:var(--text);">
+          <input type="checkbox" id="runPagespeed" style="width:auto;">
+          Also run mobile PageSpeed
+        </label>
+        <small class="hint">Adds ~15s per domain. Only adds a site-speed opportunity row - it does not change the score.</small>
+      </div>
+    </div>
+  </div>
+
   <div class="row" style="margin-top:12px;">
-    <div class="field">
+    <div class="field" id="limitField">
       <label>Leads to scan</label>
       <input id="limit" type="number" value="20" min="3" max="60">
     </div>
@@ -291,11 +423,11 @@ td{padding:9px 10px; border-bottom:1px solid var(--border);}
   <h2><span class="mono">[02]</span> Running</h2>
   <div class="rail" id="rail">
     <div class="fill" id="railFill"></div>
-    <div class="stage" data-stage="1"><div class="dot">1</div><div class="label">Scrape</div></div>
-    <div class="stage" data-stage="2"><div class="dot">2</div><div class="label">Audit</div></div>
-    <div class="stage" data-stage="3"><div class="dot">3</div><div class="label">Rank</div></div>
-    <div class="stage" data-stage="4"><div class="dot">4</div><div class="label">Build</div></div>
-    <div class="stage" data-stage="5"><div class="dot">5</div><div class="label">Outreach</div></div>
+    <div class="stage" data-stage="1"><div class="dot">1</div><div class="label" data-local="Scrape" data-ecom="Source">Scrape</div></div>
+    <div class="stage" data-stage="2"><div class="dot">2</div><div class="label" data-local="Audit" data-ecom="Fingerprint">Audit</div></div>
+    <div class="stage" data-stage="3"><div class="dot">3</div><div class="label" data-local="Rank" data-ecom="Score">Rank</div></div>
+    <div class="stage" data-stage="4"><div class="dot">4</div><div class="label" data-local="Build" data-ecom="Build">Build</div></div>
+    <div class="stage" data-stage="5"><div class="dot">5</div><div class="label" data-local="Outreach" data-ecom="Outreach">Outreach</div></div>
   </div>
   <div class="log" id="logBox"></div>
 </div>
@@ -310,6 +442,7 @@ td{padding:9px 10px; border-bottom:1px solid var(--border);}
 
 <script>
 let lastResults = null;
+let lastEcomLeads = null;
 
 function saveKeys(){
   localStorage.setItem('lp_google_key', document.getElementById('googleKey').value.trim());
@@ -407,7 +540,207 @@ function findLeadByName(leads, name){
   return matches.length === 1 ? matches[0] : null;
 }
 
+/* ---------- lead source switching ---------- */
+function currentSource(){ return document.getElementById('leadSource').value; }
+
+function onSourceChange(){
+  const ecom = currentSource() === 'ecom';
+  document.getElementById('localFields').classList.toggle('hidden', ecom);
+  document.getElementById('ecomFields').classList.toggle('hidden', !ecom);
+  document.getElementById('limitField').classList.toggle('hidden', ecom);
+  document.getElementById('previewBtn').classList.toggle('hidden', ecom);
+  document.querySelectorAll('.stage .label').forEach(el => {
+    el.textContent = ecom ? el.dataset.ecom : el.dataset.local;
+  });
+}
+onSourceChange();
+
+function parseDomains(){
+  const raw = document.getElementById('domains').value;
+  return raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+}
+
+function loadCsv(){
+  const f = document.getElementById('csvFile').files[0];
+  const status = document.getElementById('csvStatus');
+  if(!f) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try{
+      const lines = reader.result.split(/\r?\n/).filter(l => l.trim());
+      if(!lines.length) throw new Error('File is empty');
+      const header = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/^"|"$/g,''));
+      let idx = header.indexOf('domain');
+      if(idx === -1) idx = header.findIndex(h => h.includes('domain') || h.includes('website') || h.includes('url'));
+      if(idx === -1) throw new Error('No "domain" column found in the header row');
+      const vals = lines.slice(1).map(l => {
+        const cells = l.match(/("([^"]|"")*"|[^,]*)(,|$)/g) || [];
+        return (cells[idx] || '').replace(/,$/,'').trim().replace(/^"|"$/g,'');
+      }).filter(Boolean);
+      document.getElementById('domains').value = vals.join('\n');
+      status.textContent = `Loaded ${vals.length} domains from ${f.name}.`;
+      status.style.color = 'var(--sage)';
+    }catch(e){
+      status.textContent = e.message;
+      status.style.color = 'var(--rust)';
+    }
+  };
+  reader.readAsText(f);
+}
+
+function chunk(arr, n){
+  const out = [];
+  for(let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
+/* ---------- ecommerce mode ---------- */
+async function runEcomPipeline(){
+  const errBox = document.getElementById('errorPanel');
+  errBox.innerHTML = '';
+  document.getElementById('resultsSection').innerHTML = '';
+  document.getElementById('downloadRow').innerHTML = '';
+
+  const domains = parseDomains();
+  const keys = getKeys();
+  const wantPagespeed = document.getElementById('runPagespeed').checked;
+  if(!domains.length){ errBox.innerHTML = '<div class="error-box">Paste at least one domain, or upload a CSV.</div>'; return; }
+
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('progressPanel').classList.remove('hidden');
+  document.getElementById('logBox').innerHTML = '';
+  resetRail();
+
+  try{
+    logLine(1, `${domains.length} domain(s) queued.`);
+
+    // Stage 2 - fingerprint in chunks so no single request runs long
+    const batches = chunk(domains, 6);
+    let all = [], done = 0;
+    for(const batch of batches){
+      try{
+        const d = await postJSON('/api/fingerprint_batch', {domains: batch, use_cache: true});
+        all = all.concat(d.leads);
+      }catch(e){
+        logLine(2, `Chunk failed (${batch.join(', ')}): ${e.message}`, true);
+      }
+      done += batch.length;
+      logLine(2, `Fingerprinted ${Math.min(done, domains.length)}/${domains.length}`);
+    }
+    if(!all.length) throw new Error('No domains could be fingerprinted - see the log above.');
+
+    const reachable = all.filter(l => l.status === 'ok').length;
+    logLine(2, `${reachable} reachable, ${all.length - reachable} unreachable/errored.`);
+
+    // Optional PageSpeed, also chunked
+    let psMap = {};
+    if(wantPagespeed){
+      const okDomains = all.filter(l => l.status === 'ok').map(l => l.domain);
+      let psDone = 0;
+      for(const batch of chunk(okDomains, 4)){
+        try{
+          const d = await postJSON('/api/pagespeed_batch', {domains: batch, google_key: keys.google_key});
+          psMap = Object.assign(psMap, d.pagespeed);
+        }catch(e){
+          logLine(2, `PageSpeed chunk skipped: ${e.message}`, true);
+        }
+        psDone += batch.length;
+        logLine(2, `PageSpeed ${Math.min(psDone, okDomains.length)}/${okDomains.length}`);
+      }
+    }
+
+    // Stage 3 - score
+    logLine(3, 'Scoring and ranking...');
+    const scored = await postJSON('/api/score', {leads: all, pagespeed_by_domain: psMap});
+    logLine(3, 'Scoring complete.');
+    updateRail(3, 'done');
+
+    lastEcomLeads = scored.leads;
+    renderFingerprintTable(scored.leads);
+  }catch(e){
+    errBox.innerHTML = `<div class="error-box">${esc(e.message)}</div>`;
+  }finally{
+    document.getElementById('runBtn').disabled = false;
+  }
+}
+
+/* ---------- results table ---------- */
+function scoreClass(s){ return s >= 55 ? 'score-hi' : (s >= 30 ? 'score-mid' : 'score-lo'); }
+
+function renderFingerprintTable(leads){
+  const box = document.getElementById('resultsSection');
+  let rows = '';
+  leads.forEach((l, i) => {
+    if(l.status !== 'ok'){
+      rows += `<tr class="fp-row"><td class="fp-domain">${esc(l.domain)}</td>
+        <td colspan="7" class="status-bad">${esc(l.status)}</td></tr>`;
+      return;
+    }
+    const sig = l.signals || {};
+    const detectedChips = Object.entries(l.detected || {})
+      .filter(([c]) => c !== 'platform')
+      .flatMap(([c, vs]) => vs.map(v => `<span class="chip has">${esc(v)}</span>`)).join('') || '<span class="chip plat">none</span>';
+    const gapChips = (l.missing || []).map(g => `<span class="chip gap">${esc(g.product)}</span>`).join('') || '<span class="chip plat">no gaps</span>';
+    const c = l.contacts || {};
+    const email = (c.emails || [])[0] || '';
+    const ig = (c.instagram || [])[0] || '';
+    const parts = l.score_parts || {};
+
+    rows += `
+      <tr class="fp-row" onclick="toggleDetail(${i})">
+        <td class="fp-domain"><span class="fp-caret" id="caret-${i}">&#9654;</span>${esc(l.domain)}</td>
+        <td class="score-cell ${scoreClass(l.score)}">${l.score}</td>
+        <td><span class="chip plat">${esc(sig.platform || 'unknown')}</span></td>
+        <td>${detectedChips}</td>
+        <td>${gapChips}</td>
+        <td style="font-size:12.5px;">${esc((l.top_opportunity || {}).product || '-')}</td>
+        <td class="contact-cell">${email ? `<a href="mailto:${esc(email)}">${esc(email)}</a>` : '-'}</td>
+        <td class="contact-cell">${ig ? `<a href="https://instagram.com/${esc(ig)}" target="_blank">@${esc(ig)}</a>` : '-'}</td>
+      </tr>
+      <tr class="detail-row hidden" id="detail-${i}">
+        <td colspan="8">
+          <div class="detail-grid">
+            <span class="parts-item">revenue proxy <b>${parts.revenue_proxy ?? '-'}</b></span>
+            <span class="parts-item">gap value <b>${parts.gap_value ?? '-'}</b></span>
+            <span class="parts-item">reachability <b>${parts.reachability ?? '-'}</b></span>
+            <span class="parts-item">dead-store penalty <b>-${parts.dead_store_penalty ?? 0}</b></span>
+            <span class="parts-item">~products <b>${sig.product_count ?? '-'}</b></span>
+          </div>
+          ${(l.missing || []).map(g => `
+            <div class="gap-item">
+              <div class="gap-name">${esc(g.product)} <span class="parts-item">(value ${g.value_score})</span></div>
+              <div class="gap-ev">${esc(g.evidence)}</div>
+              <div class="gap-pitch">${esc(g.pitch)}</div>
+            </div>`).join('') || '<div class="parts-item">No gaps detected - they already run everything we sell.</div>'}
+        </td>
+      </tr>`;
+  });
+
+  box.innerHTML = `
+    <div class="panel">
+      <h2><span class="mono">[03]</span> Fingerprinted leads &mdash; ${leads.length} scanned</h2>
+      <div style="overflow-x:auto;">
+        <table class="fp-table">
+          <thead><tr>
+            <th>Domain</th><th>Score</th><th>Platform</th><th>Detected apps</th>
+            <th>Missing products</th><th>Top opportunity</th><th>Email</th><th>Instagram</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <small class="hint">Click any row to see the score breakdown and the evidence behind each gap.</small>
+    </div>`;
+}
+
+function toggleDetail(i){
+  const row = document.getElementById(`detail-${i}`);
+  const caret = document.getElementById(`caret-${i}`);
+  const hidden = row.classList.toggle('hidden');
+  caret.innerHTML = hidden ? '&#9654;' : '&#9660;';
+}
+
 async function runPipeline(){
+  if(currentSource() === 'ecom') return runEcomPipeline();
   const errBox = document.getElementById('errorPanel');
   errBox.innerHTML = '';
   document.getElementById('resultsSection').innerHTML = '';
